@@ -5,10 +5,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import {
+  FunctionDeclaration,
   GoogleGenAI,
   LiveServerMessage,
   Modality,
   ThinkingLevel,
+  Type,
 } from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -93,6 +95,8 @@ function isOriginAllowed(origin: string | undefined): boolean {
     if (
       hostname === "coach-ai.pages.dev" ||
       hostname.endsWith(".coach-ai.pages.dev") ||
+      hostname === "superjob-coach.pages.dev" ||
+      hostname.endsWith(".superjob-coach.pages.dev") ||
       hostname === "localhost" ||
       hostname === "127.0.0.1"
     ) {
@@ -366,14 +370,73 @@ async function startServer() {
     }
   });
 
-  // WebSocket Server for Gemini Live API (/api/live)
+  // OpenAI-compatible text completion endpoint for Coach-AI (/api/coach-chat)
+  app.post("/api/coach-chat", async (req, res) => {
+    try {
+      const ai = createAiClient();
+      const { messages = [], response_format } = req.body ?? {};
+      if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ error: { message: "messages array is required" } });
+      }
+
+      const systemParts: string[] = [];
+      const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+
+      for (const m of messages) {
+        const text = typeof m?.content === "string" ? m.content : "";
+        if (!text) continue;
+        if (m.role === "system") {
+          systemParts.push(text);
+        } else {
+          contents.push({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text }],
+          });
+        }
+      }
+
+      const config: Record<string, unknown> = {};
+      if (systemParts.length > 0) {
+        config.systemInstruction = systemParts.join("\n\n");
+      }
+      if (response_format?.type === "json_object") {
+        config.responseMimeType = "application/json";
+      }
+
+      const response = await ai.models.generateContent({
+        model: "gemini-4-hydrogen",
+        contents: contents.length > 0 ? contents : "Привет",
+        config,
+      });
+
+      const content = response.text ?? "";
+      const usageMeta = response.usageMetadata;
+      return res.json({
+        choices: [{ message: { role: "assistant", content } }],
+        usage: {
+          prompt_tokens: usageMeta?.promptTokenCount ?? 0,
+          completion_tokens: usageMeta?.candidatesTokenCount ?? 0,
+        },
+      });
+    } catch (err) {
+      const { status, message } = formatGeminiError(err);
+      return res.status(status).json({ error: { message } });
+    }
+  });
+
+  // WebSocket Server for Gemini Live API (/api/live) and Coach-AI Bridge (/api/coach-realtime)
   const wss = new WebSocketServer({ noServer: true });
+  const coachWss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (request, socket, head) => {
     const reqUrl = request.url || "";
     if (reqUrl.startsWith("/api/live")) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit("connection", ws, request);
+      });
+    } else if (reqUrl.startsWith("/api/coach-realtime")) {
+      coachWss.handleUpgrade(request, socket, head, (ws) => {
+        coachWss.emit("connection", ws, request);
       });
     }
   });
@@ -580,6 +643,306 @@ async function startServer() {
       if (parsed.type === "stop") {
         closeSession();
         sendToClient({ type: "closed" });
+      }
+    });
+
+    clientWs.on("close", () => {
+      isClosed = true;
+      closeSession();
+    });
+  });
+
+  // Coach-AI OpenAI Realtime <-> Gemini Live Bridge (/api/coach-realtime)
+  coachWss.on("connection", (clientWs: WebSocket) => {
+    let liveSession: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
+    let isClosed = false;
+    let isConnecting = false;
+    let readySent = false;
+    let errorSent = false;
+    let pendingGreet = false;
+    let turnCounter = 1;
+    let userCounter = 1;
+    let currentTurnId = `resp-${turnCounter}`;
+    let currentUserItemId = `user-${userCounter}`;
+    let currentClientTranscript = "";
+    let currentUserTranscript = "";
+
+    const sendEvent = (payload: Record<string, unknown>) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify(payload));
+      }
+    };
+
+    const closeSession = () => {
+      if (liveSession) {
+        try {
+          liveSession.close();
+        } catch {
+          // ignore
+        }
+        liveSession = null;
+      }
+    };
+
+    const triggerGreeting = () => {
+      if (!liveSession || !readySent) {
+        pendingGreet = true;
+        return;
+      }
+      pendingGreet = false;
+      try {
+        liveSession.sendRealtimeInput({
+          text: "Звонок соединён. Ответь на входящий телефонный звонок первой короткой естественной репликой клиента (например: «Алло, слушаю»).",
+        });
+      } catch {
+        // ignore
+      }
+    };
+
+    clientWs.on("message", async (raw) => {
+      if (isClosed) return;
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (msg.type === "session.update") {
+        if (isConnecting || liveSession) return;
+        isConnecting = true;
+
+        try {
+          const ai = createAiClient();
+          const sess = (msg.session as Record<string, unknown>) || {};
+          const audioCfg = (sess.audio as Record<string, unknown>) || {};
+          const outCfg = (audioCfg.output as Record<string, unknown>) || {};
+          const requestedVoice = sanitizeVoice(outCfg.voice);
+          const instructions =
+            typeof sess.instructions === "string" && sess.instructions.trim()
+              ? sess.instructions.trim()
+              : "Ты — клиент в телефонном разговоре с менеджером. Отвечай естественно и по делу на русском языке.";
+
+          const endCallDecl: FunctionDeclaration = {
+            name: "end_call",
+            description:
+              "Вызови, когда разговор окончен: договорились о следующем шаге или клиент отказал. Сначала произнеси короткую финальную фразу.",
+            parameters: {
+              type: Type.OBJECT,
+              properties: {
+                outcome: {
+                  type: Type.STRING,
+                  description:
+                    "Итог звонка с точки зрения клиента: оплата, тест, перезвон с датой, КП на почту, отказ, вопрос решён или без итога.",
+                },
+              },
+              required: ["outcome"],
+            },
+          };
+
+          const hasTools = Array.isArray(sess.tools) && sess.tools.length > 0;
+
+          liveSession = await ai.live.connect({
+            model: "gemini-3.8-live",
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: requestedVoice },
+                },
+              },
+              systemInstruction: instructions,
+              inputAudioTranscription: {},
+              outputAudioTranscription: {},
+              ...(hasTools ? { tools: [{ functionDeclarations: [endCallDecl] }] } : {}),
+            },
+            callbacks: {
+              onopen: () => {
+                // Wait for setupComplete
+              },
+              onmessage: (message: LiveServerMessage) => {
+                if (message.setupComplete && !readySent) {
+                  readySent = true;
+                  sendEvent({
+                    type: "session.updated",
+                    session: {
+                      audio: {
+                        input: { format: { type: "audio/pcm", rate: 16000 } },
+                        output: { format: { type: "audio/pcm", rate: 24000 } },
+                      },
+                    },
+                  });
+                  if (pendingGreet) {
+                    triggerGreeting();
+                  }
+                }
+
+                // Handle tool calls (e.g. end_call)
+                for (const call of message.toolCall?.functionCalls ?? []) {
+                  sendEvent({
+                    type: "response.function_call_arguments.done",
+                    name: call.name,
+                    arguments: JSON.stringify(call.args ?? {}),
+                    call_id: call.id || `call-${Date.now()}`,
+                  });
+                  if (liveSession && call.id) {
+                    try {
+                      liveSession.sendToolResponse({
+                        functionResponses: [
+                          {
+                            id: call.id,
+                            name: call.name || "end_call",
+                            response: { ok: true },
+                          },
+                        ],
+                      });
+                    } catch {
+                      // ignore
+                    }
+                  }
+                }
+
+                const content = message.serverContent;
+                if (!content) return;
+
+                if (content.inputTranscription?.text) {
+                  const chunk = content.inputTranscription.text;
+                  currentUserTranscript += chunk;
+                  sendEvent({
+                    type: "conversation.item.input_audio_transcription.delta",
+                    item_id: currentUserItemId,
+                    delta: chunk,
+                  });
+                }
+
+                if (content.outputTranscription?.text) {
+                  if (currentUserTranscript) {
+                    sendEvent({
+                      type: "conversation.item.input_audio_transcription.completed",
+                      item_id: currentUserItemId,
+                      transcript: currentUserTranscript,
+                    });
+                    userCounter += 1;
+                    currentUserItemId = `user-${userCounter}`;
+                    currentUserTranscript = "";
+                  }
+                  const chunk = content.outputTranscription.text;
+                  currentClientTranscript += chunk;
+                  sendEvent({
+                    type: "response.audio_transcript.delta",
+                    item_id: currentTurnId,
+                    delta: chunk,
+                  });
+                }
+
+                for (const part of content.modelTurn?.parts ?? []) {
+                  if (part.inlineData?.data) {
+                    sendEvent({
+                      type: "response.audio.delta",
+                      item_id: currentTurnId,
+                      delta: part.inlineData.data,
+                    });
+                  }
+                }
+
+                if (content.interrupted) {
+                  sendEvent({
+                    type: "input_audio_buffer.speech_started",
+                    item_id: currentUserItemId,
+                  });
+                }
+
+                if (content.turnComplete) {
+                  if (currentClientTranscript) {
+                    sendEvent({
+                      type: "response.audio_transcript.done",
+                      item_id: currentTurnId,
+                      transcript: currentClientTranscript,
+                    });
+                    currentClientTranscript = "";
+                  }
+                  sendEvent({
+                    type: "response.done",
+                    response: {
+                      usage: { input_tokens: 0, output_tokens: 0 },
+                    },
+                  });
+                  turnCounter += 1;
+                  currentTurnId = `resp-${turnCounter}`;
+                }
+              },
+              onerror: (err: ErrorEvent) => {
+                if (!errorSent) {
+                  errorSent = true;
+                  const { message } = formatGeminiError(
+                    err.message || "Ошибка сессии Gemini Live."
+                  );
+                  sendEvent({ type: "error", error: { message } });
+                }
+              },
+              onclose: (ev: CloseEvent) => {
+                if (!errorSent && (ev.reason || (!readySent && ev.code !== 1000))) {
+                  errorSent = true;
+                  const { message } = formatGeminiError(
+                    ev.reason || `Сессия закрыта сервером (код ${ev.code}).`
+                  );
+                  sendEvent({ type: "error", error: { message } });
+                }
+                liveSession = null;
+                if (clientWs.readyState === WebSocket.OPEN) {
+                  clientWs.close(1000, ev.reason || "closed");
+                }
+              },
+            },
+          });
+        } catch (err) {
+          const { message } = formatGeminiError(err);
+          sendEvent({ type: "error", error: { message } });
+          closeSession();
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close(1011, "gemini connect failed");
+          }
+        } finally {
+          isConnecting = false;
+        }
+        return;
+      }
+
+      if (msg.type === "response.create") {
+        triggerGreeting();
+        return;
+      }
+
+      if (msg.type === "input_audio_buffer.append" && typeof msg.audio === "string") {
+        if (liveSession && readySent) {
+          try {
+            liveSession.sendRealtimeInput({
+              audio: {
+                data: msg.audio,
+                mimeType: "audio/pcm;rate=16000",
+              },
+            });
+          } catch {
+            // ignore transient frame error
+          }
+        }
+        return;
+      }
+
+      if (msg.type === "conversation.item.create") {
+        const it = msg.item as Record<string, unknown> | undefined;
+        const contentArr = Array.isArray(it?.content) ? it.content : [];
+        const textPart = contentArr
+          .map((c: { text?: string }) => (typeof c?.text === "string" ? c.text : ""))
+          .join(" ")
+          .trim();
+        if (textPart && liveSession && readySent) {
+          try {
+            liveSession.sendRealtimeInput({ text: textPart });
+          } catch {
+            // ignore
+          }
+        }
       }
     });
 
