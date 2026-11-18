@@ -1,0 +1,6 @@
+{
+  "name": "VoxLive Studio",
+  "description": "Студия реального времени Gemini Live и выразительного синтеза речи",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
