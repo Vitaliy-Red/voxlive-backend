@@ -4,6 +4,8 @@ import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
+import { randomUUID } from "node:crypto";
+import { openCoachSession } from "./coach-session.ts";
 import {
   FunctionDeclaration,
   GoogleGenAI,
@@ -653,12 +655,15 @@ async function startServer() {
   });
 
   // Coach-AI OpenAI Realtime <-> Gemini Live Bridge (/api/coach-realtime)
-  coachWss.on("connection", (clientWs: WebSocket) => {
-    let liveSession: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
+  coachWss.on("connection", (clientWs: WebSocket, request: http.IncomingMessage) => {
+    const incoming = request.headers["x-coach-session"];
+    const trace = typeof incoming === "string" && /^[\w-]{8,64}$/.test(incoming) ? incoming : randomUUID();
+    const started = Date.now();
+    const log = (event: string, code?: number) => console.info("coach.voice", JSON.stringify({ trace, event, code, elapsedMs: Date.now() - started, turns: turnCounter - 1 }));
+    let liveSession: ReturnType<typeof openCoachSession> | null = null;
     let isClosed = false;
     let isConnecting = false;
     let readySent = false;
-    let errorSent = false;
     let pendingGreet = false;
     let turnCounter = 1;
     let userCounter = 1;
@@ -742,7 +747,7 @@ async function startServer() {
 
           const hasTools = Array.isArray(sess.tools) && sess.tools.length > 0;
 
-          liveSession = await ai.live.connect({
+          liveSession = openCoachSession(ai.live, {
             model: "gemini-3.8-live",
             config: {
               responseModalities: [Modality.AUDIO],
@@ -756,143 +761,133 @@ async function startServer() {
               outputAudioTranscription: {},
               ...(hasTools ? { tools: [{ functionDeclarations: [endCallDecl] }] } : {}),
             },
-            callbacks: {
-              onopen: () => {
-                // Wait for setupComplete
-              },
-              onmessage: (message: LiveServerMessage) => {
-                if (message.setupComplete && !readySent) {
-                  readySent = true;
-                  sendEvent({
-                    type: "session.updated",
-                    session: {
-                      audio: {
-                        input: { format: { type: "audio/pcm", rate: 16000 } },
-                        output: { format: { type: "audio/pcm", rate: 24000 } },
-                      },
+            onstatus(phase, code) {
+              log(phase, code);
+              sendEvent({ type: "coach.status", phase });
+            },
+            onmessage: (message: LiveServerMessage) => {
+              if (message.setupComplete && !readySent) {
+                readySent = true;
+                log("ready");
+                sendEvent({
+                  type: "session.updated",
+                  session: {
+                    audio: {
+                      input: { format: { type: "audio/pcm", rate: 16000 } },
+                      output: { format: { type: "audio/pcm", rate: 24000 } },
                     },
-                  });
-                  if (pendingGreet) {
-                    triggerGreeting();
-                  }
+                  },
+                });
+                if (pendingGreet) {
+                  triggerGreeting();
                 }
+              }
 
-                // Handle tool calls (e.g. end_call)
-                for (const call of message.toolCall?.functionCalls ?? []) {
-                  sendEvent({
-                    type: "response.function_call_arguments.done",
-                    name: call.name,
-                    arguments: JSON.stringify(call.args ?? {}),
-                    call_id: call.id || `call-${Date.now()}`,
-                  });
-                  if (liveSession && call.id) {
-                    try {
-                      liveSession.sendToolResponse({
-                        functionResponses: [
-                          {
-                            id: call.id,
-                            name: call.name || "end_call",
-                            response: { ok: true },
-                          },
-                        ],
-                      });
-                    } catch {
-                      // ignore
-                    }
-                  }
-                }
-
-                const content = message.serverContent;
-                if (!content) return;
-
-                if (content.inputTranscription?.text) {
-                  const chunk = content.inputTranscription.text;
-                  currentUserTranscript += chunk;
-                  sendEvent({
-                    type: "conversation.item.input_audio_transcription.delta",
-                    item_id: currentUserItemId,
-                    delta: chunk,
-                  });
-                }
-
-                if (content.outputTranscription?.text) {
-                  if (currentUserTranscript) {
-                    sendEvent({
-                      type: "conversation.item.input_audio_transcription.completed",
-                      item_id: currentUserItemId,
-                      transcript: currentUserTranscript,
+              // Handle tool calls (e.g. end_call)
+              for (const call of message.toolCall?.functionCalls ?? []) {
+                if (call.name === "end_call") log("client_end_call");
+                sendEvent({
+                  type: "response.function_call_arguments.done",
+                  name: call.name,
+                  arguments: JSON.stringify(call.args ?? {}),
+                  call_id: call.id || `call-${Date.now()}`,
+                });
+                if (liveSession && call.id) {
+                  try {
+                    liveSession.sendToolResponse({
+                      functionResponses: [
+                        {
+                          id: call.id,
+                          name: call.name || "end_call",
+                          response: { ok: true },
+                        },
+                      ],
                     });
-                    userCounter += 1;
-                    currentUserItemId = `user-${userCounter}`;
-                    currentUserTranscript = "";
+                  } catch {
+                    // ignore
                   }
-                  const chunk = content.outputTranscription.text;
-                  currentClientTranscript += chunk;
+                }
+              }
+
+              const content = message.serverContent;
+              if (!content) return;
+
+              if (content.inputTranscription?.text) {
+                const chunk = content.inputTranscription.text;
+                currentUserTranscript += chunk;
+                sendEvent({
+                  type: "conversation.item.input_audio_transcription.delta",
+                  item_id: currentUserItemId,
+                  delta: chunk,
+                });
+              }
+
+              if (content.outputTranscription?.text) {
+                if (currentUserTranscript) {
                   sendEvent({
-                    type: "response.audio_transcript.delta",
+                    type: "conversation.item.input_audio_transcription.completed",
+                    item_id: currentUserItemId,
+                    transcript: currentUserTranscript,
+                  });
+                  userCounter += 1;
+                  currentUserItemId = `user-${userCounter}`;
+                  currentUserTranscript = "";
+                }
+                const chunk = content.outputTranscription.text;
+                currentClientTranscript += chunk;
+                sendEvent({
+                  type: "response.audio_transcript.delta",
+                  item_id: currentTurnId,
+                  delta: chunk,
+                });
+              }
+
+              for (const part of content.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  sendEvent({
+                    type: "response.audio.delta",
                     item_id: currentTurnId,
-                    delta: chunk,
+                    delta: part.inlineData.data,
                   });
                 }
+              }
 
-                for (const part of content.modelTurn?.parts ?? []) {
-                  if (part.inlineData?.data) {
-                    sendEvent({
-                      type: "response.audio.delta",
-                      item_id: currentTurnId,
-                      delta: part.inlineData.data,
-                    });
-                  }
-                }
+              if (content.interrupted) {
+                sendEvent({
+                  type: "input_audio_buffer.speech_started",
+                  item_id: currentUserItemId,
+                });
+              }
 
-                if (content.interrupted) {
+              if (content.turnComplete) {
+                if (currentClientTranscript) {
                   sendEvent({
-                    type: "input_audio_buffer.speech_started",
-                    item_id: currentUserItemId,
+                    type: "response.audio_transcript.done",
+                    item_id: currentTurnId,
+                    transcript: currentClientTranscript,
                   });
+                  currentClientTranscript = "";
                 }
-
-                if (content.turnComplete) {
-                  if (currentClientTranscript) {
-                    sendEvent({
-                      type: "response.audio_transcript.done",
-                      item_id: currentTurnId,
-                      transcript: currentClientTranscript,
-                    });
-                    currentClientTranscript = "";
-                  }
-                  sendEvent({
-                    type: "response.done",
-                    response: {
-                      usage: { input_tokens: 0, output_tokens: 0 },
-                    },
-                  });
-                  turnCounter += 1;
-                  currentTurnId = `resp-${turnCounter}`;
-                }
-              },
-              onerror: (err: ErrorEvent) => {
-                if (!errorSent) {
-                  errorSent = true;
-                  const { message } = formatGeminiError(
-                    err.message || "Ошибка сессии Gemini Live."
-                  );
-                  sendEvent({ type: "error", error: { message } });
-                }
-              },
-              onclose: (ev: CloseEvent) => {
-                if (!errorSent && (ev.reason || (!readySent && ev.code !== 1000))) {
-                  errorSent = true;
-                  const { message } = formatGeminiError(
-                    ev.reason || `Сессия закрыта сервером (код ${ev.code}).`
-                  );
-                  sendEvent({ type: "error", error: { message } });
-                }
-                liveSession = null;
-                if (clientWs.readyState === WebSocket.OPEN) {
-                  clientWs.close(1000, ev.reason || "closed");
-                }
-              },
+                sendEvent({
+                  type: "response.done",
+                  response: {
+                    usage: { input_tokens: 0, output_tokens: 0 },
+                  },
+                });
+                turnCounter += 1;
+                currentTurnId = `resp-${turnCounter}`;
+              }
+            },
+            onclose: (code, reason) => {
+              log("provider_closed", code);
+              const { status } = formatGeminiError(reason);
+              const message = status === 429 ? "У голосовой модели временно исчерпан лимит." :
+                readySent ? "Соединение с голосовой моделью прервалось." : "Голосовая модель не смогла начать звонок.";
+              sendEvent({ type: "coach.error", error: { code: "provider", message } });
+              liveSession = null;
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.close(1011, "provider closed");
+              }
             },
           });
         } catch (err) {
@@ -946,7 +941,9 @@ async function startServer() {
       }
     });
 
-    clientWs.on("close", () => {
+    clientWs.on("error", () => { log("relay_error"); closeSession(); });
+    clientWs.on("close", (code) => {
+      log("relay_closed", code);
       isClosed = true;
       closeSession();
     });
